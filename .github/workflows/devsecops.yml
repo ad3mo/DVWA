@@ -1,12 +1,36 @@
 name: DevSecOps Pipeline
 
+# ── Repository variables (Settings → Secrets and variables → Actions → Variables)
+#
+# SECURITY_SCANS_MODE
+#   unset or "off" → no Semgrep / no Trivy / no Gitleaks; only Docker build → GHCR → deploy.
+#   "on"           → run all security scans before build continues.
+#
+# STRICT_SECURITY_GATE (only when SECURITY_SCANS_MODE=on)
+#   "true"  → Trivy filesystem + image scans exit non‑zero on HIGH/CRITICAL (can block deploy).
+#   unset or anything else → Trivy still runs but does not fail the job on findings (report only).
+#
+# workflow_dispatch: choose scan mode override + strict Trivy for one run without changing variables.
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      security_scans_mode:
+        description: "Security scans — repo uses variable; on/off overrides for this run only"
+        type: choice
+        options:
+          - repo
+          - "on"
+          - "off"
+        default: repo
+      strict_trivy_gate:
+        description: "When scans are on: fail Trivy on HIGH/CRITICAL (this run only on manual dispatch)"
+        type: boolean
+        default: false
 
-# packages:write is required to push the image to GHCR after the build passes.
 permissions:
   contents: read
   packages: write
@@ -17,56 +41,127 @@ env:
 
 jobs:
 
-  # ─── JOB 1: SAST (Semgrep) — disabled for demo ───────────────────────────
-  # Semgrep was failing on DVWA (intentionally vulnerable) and blocked deploy.
-  # To turn real SAST back on: restore container semgrep/semgrep + checkout + "semgrep scan --error ...".
-  sast-scan:
-    name: SAST Scan (Semgrep) — skipped for demo
+  # Resolves scan mode once for all downstream jobs
+  pipeline-config:
+    name: Pipeline config
     runs-on: ubuntu-latest
+    outputs:
+      scans: ${{ steps.set.outputs.scans }}
+      trivy_exit: ${{ steps.set.outputs.trivy_exit }}
     steps:
-      - name: Skip Semgrep (demo)
-        run: echo "SAST (Semgrep) skipped so pipeline can reach Docker + deploy. Re-enable before production."
+      - id: set
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SCAN_MODE: ${{ inputs.security_scans_mode }}
+          VAR_SCAN_MODE: ${{ vars.SECURITY_SCANS_MODE }}
+          INPUT_STRICT: ${{ inputs.strict_trivy_gate }}
+          VAR_STRICT: ${{ vars.STRICT_SECURITY_GATE }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "${INPUT_SCAN_MODE:-repo}" in
+              on) EFFECTIVE=on ;;
+              off) EFFECTIVE=off ;;
+              *) EFFECTIVE="${VAR_SCAN_MODE:-off}" ;;
+            esac
+            if [ "${INPUT_STRICT:-false}" = "true" ] || [ "${VAR_STRICT:-false}" = "true" ]; then
+              STRICT=true
+            else
+              STRICT=false
+            fi
+          else
+            EFFECTIVE="${VAR_SCAN_MODE:-off}"
+            case "${VAR_STRICT:-false}" in
+              true) STRICT=true ;;
+              *) STRICT=false ;;
+            esac
+          fi
+          [ -z "$EFFECTIVE" ] && EFFECTIVE=off
+          echo "scans=$EFFECTIVE" >> "$GITHUB_OUTPUT"
+          if [ "$EFFECTIVE" = "on" ] && [ "$STRICT" = "true" ]; then
+            echo "trivy_exit=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "trivy_exit=0" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "## Pipeline mode"
+            echo "- **SECURITY_SCANS_MODE (effective):** $EFFECTIVE"
+            echo "- **STRICT_SECURITY_GATE (Trivy exit 1):** $STRICT"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  # ─── JOB 2: Dependency Scan ───────────────────────────────────────────────
+  sast-scan:
+    name: SAST Scan (Semgrep)
+    runs-on: ubuntu-latest
+    needs: [pipeline-config]
+    steps:
+      - name: Semgrep skipped (scans off)
+        if: needs.pipeline-config.outputs.scans != 'on'
+        run: echo "Semgrep skipped — set repository variable SECURITY_SCANS_MODE=on to enable."
+
+      - name: Checkout code
+        if: needs.pipeline-config.outputs.scans == 'on'
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        if: needs.pipeline-config.outputs.scans == 'on'
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e SEMGREP_APP_TOKEN="${SEMGREP_APP_TOKEN}" \
+            semgrep/semgrep semgrep scan --error \
+            --config=p/default --config=p/owasp-top-ten --config=p/php
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
   dependency-scan:
     name: Dependency Scan (Trivy)
     runs-on: ubuntu-latest
+    needs: [pipeline-config]
     steps:
+      - name: Trivy FS skipped (scans off)
+        if: needs.pipeline-config.outputs.scans != 'on'
+        run: echo "Trivy filesystem scan skipped — set SECURITY_SCANS_MODE=on to enable."
+
       - name: Checkout code
+        if: needs.pipeline-config.outputs.scans == 'on'
         uses: actions/checkout@v4
 
       - name: Run Trivy filesystem scan
+        if: needs.pipeline-config.outputs.scans == 'on'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
           format: table
-          exit-code: "1"
+          exit-code: ${{ needs.pipeline-config.outputs.trivy_exit }}
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-  # ─── JOB 3: Secret Detection ──────────────────────────────────────────────
   secret-scan:
     name: Secret Detection (Gitleaks)
     runs-on: ubuntu-latest
+    needs: [pipeline-config]
     steps:
+      - name: Gitleaks skipped (scans off)
+        if: needs.pipeline-config.outputs.scans != 'on'
+        run: echo "Gitleaks skipped — set SECURITY_SCANS_MODE=on to enable."
+
       - name: Checkout code
+        if: needs.pipeline-config.outputs.scans == 'on'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Run Gitleaks
+        if: needs.pipeline-config.outputs.scans == 'on'
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional: only required for certain Gitleaks Enterprise / license scenarios.
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
-  # ─── JOB 4: Docker Build + Image Scan + Push to GHCR ─────────────────────
   docker-build-scan:
     name: Docker Build + Image Scan + GHCR Push
     runs-on: ubuntu-latest
-    needs: [sast-scan, dependency-scan, secret-scan]
+    needs: [pipeline-config, sast-scan, dependency-scan, secret-scan]
     outputs:
       deploy_image: ${{ steps.image.outputs.deploy_image }}
     steps:
@@ -92,25 +187,26 @@ jobs:
         run: |
           docker build -t "${FULL_IMAGE}:${{ env.IMAGE_TAG }}" -t "${FULL_IMAGE}:latest" .
 
+      - name: Trivy image scan skipped (scans off)
+        if: needs.pipeline-config.outputs.scans != 'on'
+        run: echo "Trivy image scan skipped — set SECURITY_SCANS_MODE=on to enable."
+
       - name: Run Trivy image scan
+        if: needs.pipeline-config.outputs.scans == 'on'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
           format: table
-          exit-code: "1"
+          exit-code: ${{ needs.pipeline-config.outputs.trivy_exit }}
           severity: CRITICAL,HIGH
           ignore-unfixed: true
 
-      # Only push on branch pushes (not fork PRs); PR workflows still build+scan above.
       - name: Push Docker image to GHCR
         if: github.event_name == 'push'
         run: |
           docker push "${FULL_IMAGE}:${{ env.IMAGE_TAG }}"
           docker push "${FULL_IMAGE}:latest"
 
-  # Deploy pulls the image pushed in docker-build-scan. DVWA still needs MariaDB/MySQL
-  # reachable from the container (set DVWA_DB_SERVER — e.g. RDS, EC2 private IP, or docker host gateway).
-  # ─── JOB 5: Deploy (only after scans + push; main/master only) ─────────────
   deploy:
     name: Deploy to Server
     runs-on: ubuntu-latest
