@@ -1,10 +1,8 @@
 name: Docker Image CI
 
+# DevSecOps workflow builds and pushes dvwa-app to GHCR; this legacy workflow is manual only.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
 
 jobs:
   build:

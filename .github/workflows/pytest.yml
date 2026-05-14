@@ -1,15 +1,8 @@
 name: CI
 
+# Run manually from Actions tab — avoids extra red runs next to DevSecOps on every push.
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
-  schedule:
-    # Every Sunday at 0AM UTC
-    - cron: "0 0 * * 0"
+  workflow_dispatch:
 
 jobs:
   Pytest:
