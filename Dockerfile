@@ -1,4 +1,4 @@
-FROM php:8.1-apache
+FROM php:8.2-apache
 
 # Match upstream DVWA image: GD (JPEG/Freetype), mysqli + PDO MySQL, Apache rewrite (API .htaccess), ping (Command Injection lab).
 RUN apt-get update && apt-get install -y --no-install-recommends \
