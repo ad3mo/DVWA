@@ -227,7 +227,17 @@ jobs:
           envs: DEPLOY_IMAGE,REMOTE_DB_SERVER
           script: |
             set -eo pipefail
+            # Secrets often include a trailing newline — PHP would see "dvwa-db\n" and DNS fails.
+            DB_HOST=$(printf '%s' "${REMOTE_DB_SERVER}" | tr -d '\r\n' | xargs)
+            if [ -z "$DB_HOST" ]; then
+              echo "REMOTE_DB_SERVER / DVWA_DB_SERVER is empty after trim; set GitHub secret DVWA_DB_SERVER (e.g. dvwa-db)"
+              exit 1
+            fi
             docker network inspect dvwa-net >/dev/null 2>&1 || docker network create dvwa-net
+            # DB container must be on the same user-defined network as the app for Docker DNS (dvwa-db).
+            if docker inspect dvwa-db >/dev/null 2>&1; then
+              docker network connect dvwa-net dvwa-db 2>/dev/null || true
+            fi
             docker pull "$DEPLOY_IMAGE"
             docker stop dvwa-running || true
             docker rm dvwa-running || true
@@ -236,5 +246,5 @@ jobs:
               --network dvwa-net \
               --restart unless-stopped \
               -p 80:80 \
-              -e DB_SERVER="${REMOTE_DB_SERVER}" \
+              -e DB_SERVER="$DB_HOST" \
               "$DEPLOY_IMAGE"
