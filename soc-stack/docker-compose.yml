@@ -1,0 +1,41 @@
+# SOC demo: Loki (logs) + Promtail (collect) + Grafana (UI + alerts)
+# Run on the same EC2 as DVWA. Do not expose Grafana to 0.0.0.0/0 in production.
+services:
+  loki:
+    image: grafana/loki:2.9.5
+    command: -config.file=/etc/loki/config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/config.yaml
+      - loki-data:/loki
+    expose:
+      - "3100"
+
+  promtail:
+    image: grafana/promtail:2.9.5
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/tmp
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    # Restrict EC2 security group: inbound TCP 3000 from YOUR IP only (not 0.0.0.0/0).
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-ChangeMeInEnv!}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_ADDR: 0.0.0.0
+    volumes:
+      - ./grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - loki
+
+volumes:
+  loki-data: {}
+  promtail-positions: {}
